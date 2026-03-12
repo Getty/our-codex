@@ -1,0 +1,401 @@
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use File::Spec;
+use File::Basename qw(basename);
+use Cwd qw(abs_path getcwd);
+
+# our-codex — from each .claude/, to each AGENTS.md
+#
+# Reads .claude/ directories (skills, agents, CLAUDE.md) and assembles
+# them into a single AGENTS.md that Codex understands. Then launches Codex.
+#
+# WHY: Claude Code uses .claude/skills/ and .claude/agents/ for context.
+# Codex uses AGENTS.md. This script translates one into the other so you
+# can reuse the same knowledge base across both tools.
+#
+# HOW IT WORKS:
+#
+#   1. Collects .claude/skills/*/SKILL.md, .claude/agents/*.md, and
+#      CLAUDE.md from the current directory (and optionally parent dirs)
+#   2. Strips YAML frontmatter, keeps the content body
+#   3. For agents: strips <example> blocks from descriptions (too verbose)
+#   4. Writes everything into one AGENTS.md in the current directory
+#   5. Waits for Enter, then exec's into Codex
+#
+# HIERARCHY:
+#
+#   By default, only the current directory's .claude/ is used.
+#   Pass a parent directory as argument to include its .claude/ too.
+#   Content is ordered parent-first, project-last (Codex gives priority
+#   to later content, so project-specific stuff wins).
+#
+#   +skill-name pulls individual skills from ANYWHERE in the full
+#   hierarchy (including ~/.claude/) without including everything.
+#
+# USAGE:
+#
+#   our-codex [base-dir] [+skill ...] [-r|--resume] [-- codex-args...]
+#
+#   base-dir      How far up to look for .claude/ directories.
+#                 Default: current directory only.
+#                 Use ".." for parent, "../.." for grandparent, etc.
+#
+#   +skill-name   Include an extra skill by name. Searches all .claude/skills/
+#                 directories from ~/.claude/ down to CWD. First match wins.
+#                 Can be specified multiple times.
+#
+#   -r, --resume  Resume the last Codex session in this directory.
+#                 Regenerates AGENTS.md first, then runs `codex resume --last`.
+#
+#   -- args       Everything after "--" is forwarded to Codex as-is.
+#
+# EXAMPLES:
+#
+#   cd ~/dev/perl/my-project
+#
+#   our-codex                       Only my-project/.claude/ + CLAUDE.md
+#   our-codex ..                    Include ~/dev/perl/.claude/ too
+#   our-codex +github-cli           Just CWD + github-cli from ~/.claude/
+#   our-codex .. +vast-ai-cli       Parent chain + extra skill
+#   our-codex +github-cli +claude-code  CWD + two global skills
+#   our-codex -r                    Resume last session (regenerates AGENTS.md)
+#   our-codex .. -r                 Resume with parent context
+#   our-codex -- --full-auto        Pass --full-auto to Codex
+#   our-codex .. -- "fix the tests" One-shot prompt with parent context
+#
+# OUTPUT:
+#
+#   Writes AGENTS.md in CWD with a Sources index showing what was included
+#   and where it came from. Warns if:
+#   - AGENTS.md is not in .gitignore (it's generated, don't track it)
+#   - Combined size exceeds Codex's 32 KiB default limit
+#     (increase with project_doc_max_bytes in ~/.codex/config.toml)
+#
+# INSTALL:
+#
+#   git clone https://github.com/Getty/our-codex.git
+#   ln our-codex/our-codex ~/bin/our-codex   # or anywhere in PATH
+#
+# REQUIREMENTS: Perl 5 (core modules only), npx, @openai/codex
+
+my $cwd = abs_path(getcwd());
+
+# --- Parse arguments ---
+
+my $base_dir;
+my @extra_skills;
+my @codex_args;
+my $seen_dashdash = 0;
+my $resume = 0;
+
+for my $arg (@ARGV) {
+  if ($seen_dashdash) {
+    push @codex_args, $arg;
+  }
+  elsif ($arg eq '--') {
+    $seen_dashdash = 1;
+  }
+  elsif ($arg eq '--resume' || $arg eq '-r') {
+    $resume = 1;
+  }
+  elsif ($arg =~ /^\+(.+)/) {
+    push @extra_skills, $1;
+  }
+  elsif (!$base_dir && -d $arg) {
+    $base_dir = abs_path($arg);
+  }
+  else {
+    push @codex_args, $arg;
+  }
+}
+
+$base_dir //= $cwd;
+
+# Ensure base_dir is at or above CWD
+die "Base directory must be at or above CWD\n"
+  unless $cwd =~ /^\Q$base_dir\E(\/|$)/;
+
+my $home = $ENV{HOME};
+
+# --- Collect .claude/ directories from base_dir down to CWD ---
+
+my @claude_sources;  # { label => ..., claude_dir => ..., dir => ... }
+
+my @base_parts = File::Spec->splitdir($base_dir);
+my @cwd_parts  = File::Spec->splitdir($cwd);
+
+for my $i ($#base_parts .. $#cwd_parts) {
+  my $dir = File::Spec->catdir(@cwd_parts[0 .. $i]);
+  my $claude = File::Spec->catdir($dir, '.claude');
+  my $claude_md = File::Spec->catfile($dir, 'CLAUDE.md');
+  next unless -d $claude || -f $claude_md;
+  my $label = ($dir eq $cwd) ? basename($dir) : basename($dir) . '/';
+  push @claude_sources, {
+    dir       => $dir,
+    claude_dir => (-d $claude ? $claude : undef),
+    label     => $label,
+  };
+}
+
+# --- Build the full .claude/ search path for +skills ---
+# Walk from home down to CWD collecting all .claude/skills/ dirs
+
+my @all_skill_dirs;
+{
+  # Home first
+  my $gs = File::Spec->catdir($home, '.claude', 'skills');
+  push @all_skill_dirs, $gs if -d $gs;
+
+  # Then walk from root to CWD
+  for my $i (1 .. $#cwd_parts) {
+    my $dir = File::Spec->catdir(@cwd_parts[0 .. $i]);
+    next if $dir eq $home;
+    my $sd = File::Spec->catdir($dir, '.claude', 'skills');
+    push @all_skill_dirs, $sd if -d $sd;
+  }
+}
+
+# --- Collect content ---
+
+my @sections;
+my $claude_md_content;
+
+for my $source (@claude_sources) {
+  my $claude_dir = $source->{claude_dir};
+  my $label      = $source->{label};
+
+  if ($claude_dir) {
+    # Skills
+    my $skills_dir = File::Spec->catdir($claude_dir, 'skills');
+    if (-d $skills_dir) {
+      for my $skill_name (_list_subdirs($skills_dir)) {
+        my $skill_file = File::Spec->catfile($skills_dir, $skill_name, 'SKILL.md');
+        next unless -f $skill_file;
+        my ($meta, $body) = _read_frontmatter($skill_file);
+        next unless $body;
+        my $name = $meta->{name} || $skill_name;
+        push @sections, { type => 'skill', name => $name, from => $label, body => $body };
+      }
+    }
+
+    # Agents
+    my $agents_dir = File::Spec->catdir($claude_dir, 'agents');
+    if (-d $agents_dir) {
+      for my $agent_file (sort glob(File::Spec->catfile($agents_dir, '*.md'))) {
+        my ($meta, $body) = _read_frontmatter($agent_file);
+        next unless $body;
+        my $name = $meta->{name} || basename($agent_file, '.md');
+        my $desc = $meta->{description} || '';
+        $desc =~ s/<example>.*?<\/example>//gs;
+        $desc =~ s/\s+/ /g;
+        $desc =~ s/^\s+|\s+$//g;
+        push @sections, {
+          type => 'agent', name => $name, from => $label, desc => $desc, body => $body,
+        };
+      }
+    }
+  }
+
+  # CLAUDE.md
+  my $cm = File::Spec->catfile($source->{dir}, 'CLAUDE.md');
+  if (-f $cm) {
+    my $content = _slurp($cm);
+    if ($content && $content =~ /\S/) {
+      $claude_md_content .= "\n\n" if $claude_md_content;
+      $claude_md_content .= "### From $label\n\n$content";
+    }
+  }
+}
+
+# --- Resolve +extra skills ---
+
+my %seen_skills = map { $_->{name} => 1 } grep { $_->{type} eq 'skill' } @sections;
+
+for my $want (@extra_skills) {
+  if ($seen_skills{$want}) {
+    warn "Skill '$want' already included, skipping\n";
+    next;
+  }
+
+  my $found;
+  for my $search_dir (@all_skill_dirs) {
+    my $skill_file = File::Spec->catfile($search_dir, $want, 'SKILL.md');
+    next unless -f $skill_file;
+    my ($meta, $body) = _read_frontmatter($skill_file);
+    next unless $body;
+    my $name = $meta->{name} || $want;
+    my $from = $search_dir;
+    $from =~ s/\Q$home\E/~/;
+    push @sections, { type => 'skill', name => $name, from => "+$want ($from)", body => $body };
+    $seen_skills{$name} = 1;
+    $found = 1;
+    last;
+  }
+
+  warn "Skill '$want' not found in any .claude/skills/ directory!\n" unless $found;
+}
+
+# --- Assemble AGENTS.md ---
+
+unless (@sections || $claude_md_content) {
+  warn "Nothing to write — no .claude/ content found.\n";
+  _launch_codex();
+}
+
+my @output;
+
+push @output, "# AGENTS.md";
+push @output, "";
+push @output, "Auto-generated by our-codex. Do not edit.";
+push @output, "";
+
+# List what was included
+push @output, "## Sources";
+push @output, "";
+for my $s (@sections) {
+  push @output, sprintf("- %s: **%s** (%s)", $s->{type}, $s->{name}, $s->{from});
+}
+push @output, "- CLAUDE.md" if $claude_md_content;
+push @output, "";
+
+# Content
+for my $s (@sections) {
+  if ($s->{type} eq 'skill') {
+    push @output, "---";
+    push @output, "";
+    push @output, "## Skill: $s->{name}";
+    push @output, "";
+    push @output, $s->{body};
+    push @output, "";
+  }
+  elsif ($s->{type} eq 'agent') {
+    push @output, "---";
+    push @output, "";
+    push @output, "## Agent: $s->{name}";
+    push @output, "";
+    if ($s->{desc}) {
+      push @output, "> $s->{desc}";
+      push @output, "";
+    }
+    push @output, $s->{body};
+    push @output, "";
+  }
+}
+
+if ($claude_md_content) {
+  push @output, "---";
+  push @output, "";
+  push @output, "## Project Instructions (CLAUDE.md)";
+  push @output, "";
+  push @output, $claude_md_content;
+  push @output, "";
+}
+
+# Write
+my $agents_md = File::Spec->catfile($cwd, 'AGENTS.md');
+my $content = join("\n", @output) . "\n";
+my $size = length($content);
+
+open my $fh, '>', $agents_md or die "Cannot write $agents_md: $!\n";
+print $fh $content;
+close $fh;
+
+# --- Summary ---
+
+print "\n  our-codex -- from each .claude/, to each AGENTS.md\n";
+
+my $n_skills = grep { $_->{type} eq 'skill' } @sections;
+my $n_agents = grep { $_->{type} eq 'agent' } @sections;
+
+print "\n";
+printf "  %s (%.1f KiB)\n", $agents_md, $size / 1024;
+printf "  %d skills, %d agents%s\n",
+  $n_skills, $n_agents,
+  ($claude_md_content ? ', CLAUDE.md' : '');
+
+if ($size > 32 * 1024) {
+  warn sprintf(
+    "\n  WARNING: %.1f KiB exceeds Codex 32 KiB default limit.\n",
+    $size / 1024
+  );
+  warn "  Set project_doc_max_bytes in ~/.codex/config.toml\n";
+}
+
+# Check .gitignore
+my $gitignore = File::Spec->catfile($cwd, '.gitignore');
+my $ignored = 0;
+if (-f $gitignore) {
+  my $gi = _slurp($gitignore);
+  $ignored = 1 if $gi =~ /^\/?AGENTS\.md$/m;
+}
+unless ($ignored) {
+  warn "\n  AGENTS.md is not in .gitignore! Add: AGENTS.md\n";
+}
+
+# Launch
+_launch_codex();
+
+# --- Functions ---
+
+sub _launch_codex {
+  if (-t STDIN) {
+    my @cmd = ('npx', '--yes', '@openai/codex@latest');
+    if ($resume) {
+      push @cmd, 'resume', '--last';
+    }
+    push @cmd, @codex_args;
+    print "\n  > " . join(' ', @cmd) . "\n\n";
+    exec @cmd;
+    die "Failed to exec codex: $!\n";
+  }
+  exit 0;
+}
+
+sub _list_subdirs {
+  my ($parent) = @_;
+  opendir my $dh, $parent or return ();
+  my @names;
+  while (my $entry = readdir $dh) {
+    next if $entry =~ /^\./;
+    next unless -d File::Spec->catdir($parent, $entry);
+    push @names, $entry;
+  }
+  closedir $dh;
+  return sort @names;
+}
+
+sub _read_frontmatter {
+  my ($file) = @_;
+  my $raw = _slurp($file);
+  return ({}, '') unless defined $raw;
+
+  my %meta;
+  my $body = $raw;
+
+  if ($raw =~ /\A---\s*\n(.*?\n)---\s*\n(.*)\z/s) {
+    my ($fm, $rest) = ($1, $2);
+    $body = $rest;
+    for my $line (split /\n/, $fm) {
+      if ($line =~ /^(\w[\w-]*):\s*(.+)/) {
+        my ($k, $v) = ($1, $2);
+        $v =~ s/^["']|["']$//g;
+        $meta{$k} = $v;
+      }
+    }
+  }
+
+  $body =~ s/^\s+//;
+  $body =~ s/\s+$//;
+
+  return (\%meta, $body);
+}
+
+sub _slurp {
+  my ($file) = @_;
+  open my $fh, '<', $file or return undef;
+  local $/;
+  my $content = <$fh>;
+  close $fh;
+  return $content;
+}
